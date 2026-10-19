@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Real-time browser geolocation tracker with a live map, accuracy radius and auto-follow, built with Leaflet and the Geolocation API.">
+    <meta name="theme-color" content="#1e4e9c">
+    <meta name="referrer" content="strict-origin-when-cross-origin">
+    <title>Realtime Geolocation Tracker</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%231e4e9c' d='M12 2a7 7 0 0 0-7 7c0 5.2 7 13 7 13s7-7.8 7-13a7 7 0 0 0-7-7zm0 9.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5z'/%3E%3C/svg%3E">
+    <link rel="stylesheet"
+          href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+          crossorigin="">
+    <style>
+        :root {
+            --bg: #1e4e9c;
+            --text: #ffffff;
+            --text-muted: #dbe6f7;
+            --surface: #ffffff;
+            --accent: #1e4e9c;
+            --radius: 10px;
+            --gutter: clamp(0.75rem, 4vw, 2rem);
+        }
+
+        * { box-sizing: border-box; }
+
+        html, body {
+            height: 100%;
+            margin: 0;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            background: var(--bg);
+            color: var(--text);
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+
+        .header {
+            padding: 1.25rem var(--gutter) 0.5rem;
+            text-align: center;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 1.75rem;
+            font-weight: 700;
+        }
+
+        .status {
+            margin: 0.5rem 0 0;
+            min-height: 1.4em;
+            color: var(--text-muted);
+            font-size: 0.95rem;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 0.5rem;
+            padding: 0.5rem var(--gutter) 1rem;
+        }
+
+        .controls button {
+            padding: 0.55rem 1rem;
+            border: 0;
+            border-radius: 6px;
+            background: var(--surface);
+            color: var(--accent);
+            font: inherit;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .controls button[hidden] { display: none; }
+
+        .controls button:focus-visible {
+            outline: 3px solid var(--text);
+            outline-offset: 2px;
+        }
+
+        #map {
+            flex: 1 1 auto;
+            min-height: 320px;
+            margin: 0 var(--gutter) var(--gutter);
+            border-radius: var(--radius);
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
+        }
+
+        .noscript {
+            margin: 1rem var(--gutter);
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <h1>Realtime Geolocation Tracker</h1>
+        <p class="status" id="status" role="status" aria-live="polite">Starting...</p>
+    </header>
+
+    <div class="controls">
+        <button id="followBtn" type="button" aria-pressed="true">Auto-follow: On</button>
+        <button id="enableBtn" type="button" hidden>Enable location</button>
+    </div>
+
+    <div id="map" role="application" aria-label="Interactive map showing your current location"></div>
+
+    <noscript><p class="noscript">This app needs JavaScript to display the map.</p></noscript>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+            crossorigin=""></script>
+    <script>
+        (function () {
+            'use strict';
+
+            // ---- Configuration -------------------------------------------------
+            var WORLD_VIEW = { center: [20, 0], zoom: 2 };   // Neutral view before the first fix
+            var MAX_FIT_ZOOM = 16;                           // Closest zoom when framing the first fix
+            var FOLLOW_MIN_ZOOM = 16;                        // Zoom used when re-centering
+
+            var WATCH_OPTIONS = {
+                fast:    { enableHighAccuracy: false, maximumAge: 30000, timeout: 30000 },
+                precise: { enableHighAccuracy: true,  maximumAge: 30000, timeout: 20000 }
+            };
+
+            // ---- Elements ------------------------------------------------------
+            var statusEl = document.getElementById('status');
+            var followBtn = document.getElementById('followBtn');
+            var enableBtn = document.getElementById('enableBtn');
+
+            // ---- State ---------------------------------------------------------
+            var marker = null;
+            var accuracyCircle = null;
+            var following = true;
+            var watchId = null;
+            var preciseMode = false;
+            var upgradeAttempted = false;
+
+            var prefersReducedMotion = window.matchMedia &&
+                window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+            // ---- Map -----------------------------------------------------------
+            var map = L.map('map').setView(WORLD_VIEW.center, WORLD_VIEW.zoom);
+
+            // Esri tiles need no API key; OpenStreetMap requires a referrer, which
+            // web servers (e.g. GitHub Pages, localhost) send and file:/// pages do not.
+            var esriStreets = L.tileLayer(
+                'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+                { attribution: 'Tiles &copy; Esri', maxZoom: 19 }
+            );
+
+            var esriSatellite = L.tileLayer(
+                'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                { attribution: 'Tiles &copy; Esri', maxZoom: 19 }
+            );
+
+            var openStreetMap = L.tileLayer(
+                'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                {
+                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+                    maxZoom: 19
+                }
+            );
+
+            esriStreets.addTo(map);
+
+            L.control.layers({
+                'Streets': esriStreets,
+                'Satellite': esriSatellite,
+                'OpenStreetMap': openStreetMap
+            }).addTo(map);
+
+            // ---- UI helpers ----------------------------------------------------
+            function setStatus(text) {
+                statusEl.textContent = text;
+            }
+
+            function setFollowing(value) {
+                following = value;
+                followBtn.setAttribute('aria-pressed', String(value));
+                followBtn.textContent = 'Auto-follow: ' + (value ? 'On' : 'Off');
+            }
+
+            function recenter() {
+                if (!marker) {
+                    return;
+                }
+                var zoom = Math.max(map.getZoom(), FOLLOW_MIN_ZOOM);
+                if (prefersReducedMotion) {
+                    map.setView(marker.getLatLng(), zoom, { animate: false });
+                } else {
+                    map.flyTo(marker.getLatLng(), zoom);
+                }
+                marker.openPopup();
+            }
+
+            // ---- Position handling ---------------------------------------------
+            function updatePosition(position) {
+                var latlng = [position.coords.latitude, position.coords.longitude];
+                var accuracy = position.coords.accuracy;
+
+                setStatus(
+                    latlng[0].toFixed(6) + '°, ' + latlng[1].toFixed(6) +
+                    '°  (accuracy ±' + Math.round(accuracy) + ' m)'
+                );
+
+                if (!marker) {
+                    marker = L.marker(latlng, { alt: 'Your current location' })
+                        .addTo(map)
+                        .bindPopup('Your current location');
+                    accuracyCircle = L.circle(latlng, { radius: accuracy, weight: 1 }).addTo(map);
+                    // Frame the first fix according to how precise it is
+                    map.fitBounds(accuracyCircle.getBounds(), { maxZoom: MAX_FIT_ZOOM });
+                    marker.openPopup();
+                    return;
+                }
+
+                marker.setLatLng(latlng);
+                accuracyCircle.setLatLng(latlng).setRadius(accuracy);
+                if (following) {
+                    map.panTo(latlng);
+                }
+            }
+
+            function handlePosition(position) {
+                enableBtn.hidden = true;
+                updatePosition(position);
+
+                // The fast fix has arrived: try once to upgrade to high accuracy (GPS where available)
+                if (!preciseMode && !upgradeAttempted) {
+                    upgradeAttempted = true;
+                    startWatching(true);
+                }
+            }
+
+            function handleError(error) {
+                if (error.code === error.PERMISSION_DENIED) {
+                    stopWatching();
+                    setStatus('Location access is blocked. Allow it in your browser\'s site settings, then select "Enable location".');
+                    enableBtn.hidden = false;
+                } else if (preciseMode) {
+                    // High accuracy stalled or failed: fall back to the fast network-based fix
+                    startWatching(false);
+                } else if (!marker) {
+                    setStatus('Still looking for your location...');
+                }
+            }
+
+            // ---- Watching ------------------------------------------------------
+            function stopWatching() {
+                if (watchId !== null) {
+                    navigator.geolocation.clearWatch(watchId);
+                    watchId = null;
+                }
+            }
+
+            function startWatching(precise) {
+                stopWatching();
+                preciseMode = precise;
+                // One active request at a time, so the browser shows a single permission prompt
+                watchId = navigator.geolocation.watchPosition(
+                    handlePosition,
+                    handleError,
+                    precise ? WATCH_OPTIONS.precise : WATCH_OPTIONS.fast
+                );
+            }
+
+            function requestLocation() {
+                enableBtn.hidden = true;
+                setStatus('Waiting for location permission...');
+                startWatching(false);
+            }
+
+            // ---- Controls ------------------------------------------------------
+            // Dragging the map pauses auto-follow so the user can explore freely
+            map.on('dragstart', function () {
+                setFollowing(false);
+            });
+
+            followBtn.addEventListener('click', function () {
+                setFollowing(!following);
+                if (following) {
+                    recenter();
+                }
+            });
+
+            enableBtn.addEventListener('click', requestLocation);
+
+            // ---- Startup -------------------------------------------------------
+            function promptForLocation(message) {
+                setStatus(message);
+                enableBtn.hidden = false;
+            }
+
+            function start() {
+                if (!('geolocation' in navigator)) {
+                    setStatus('Geolocation is not supported by this browser.');
+                    return;
+                }
+                if (window.isSecureContext === false) {
+                    setStatus('Location requires a secure (HTTPS) connection.');
+                    return;
+                }
+                if (!(navigator.permissions && navigator.permissions.query)) {
+                    promptForLocation('Select "Enable location" to find your position.');
+                    return;
+                }
+
+                // Start automatically only if permission was already granted; otherwise the
+                // request follows a click, which browsers handle most reliably.
+                navigator.permissions.query({ name: 'geolocation' }).then(function (permission) {
+                    if (permission.state === 'granted') {
+                        setStatus('Getting your location...');
+                        startWatching(false);
+                    } else {
+                        promptForLocation('Select "Enable location", then choose Allow in the browser prompt.');
+                    }
+
+                    permission.onchange = function () {
+                        if (permission.state === 'granted' && watchId === null) {
+                            enableBtn.hidden = true;
+                            setStatus('Getting your location...');
+                            startWatching(false);
+                        }
+                    };
+                }).catch(function () {
+                    promptForLocation('Select "Enable location" to find your position.');
+                });
+            }
+
+            start();
+        }());
+    </script>
+</body>
+</html>
